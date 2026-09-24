@@ -54,14 +54,8 @@ Index: **unique (event_id, user_id)** – prevents duplicate registration.
 | registration_id | string | → `registrations._id`, **unique index** |
 | present | bool | |
 | marked_at | datetime | |
-| marked_by | string | → `users._id` (admin) |
 
-### certificates
-| Field | Type | Notes |
-| --- | --- | --- |
-| registration_id | string | → `registrations._id` |
-| certificate_number | string | generated |
-| issued_at | datetime | |
+*Note: Certificates are dynamically derived and issued when an attendance record has `present: true`. Certificates join `attendance` → `registrations` → `events` & `users`.*
 
 ### announcements
 | Field | Type | Notes |
@@ -75,17 +69,16 @@ Index: **unique (event_id, user_id)** – prevents duplicate registration.
 ### login_attempts
 | Field | Type | Notes |
 | --- | --- | --- |
-| identifier | string | email, **unique index** |
-| failed | int | consecutive failures |
-| locked_until | datetime \| null | |
+| identifier | string | `<client_ip>:<email>` (login) or `reg_limit:<ip>` (register), **unique index** |
+| failed | int | consecutive attempts |
+| locked_until | datetime \| null | lockout expiry |
 | updated_at | datetime | |
 
 ## Relationships (logical)
 
 ```
 users 1 ──< registrations >── 1 events >── 1 categories (by name)
-registrations 1 ── 1 attendance
-registrations 1 ── 1 certificates
+registrations 1 ── 1 attendance (present: true -> certificate)
 events 1 ──< announcements
 ```
 

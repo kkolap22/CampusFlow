@@ -22,9 +22,10 @@ mirroring the relational schema shown in the project report):
 """
 import html
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
@@ -32,6 +33,7 @@ load_dotenv(Path(__file__).parent / ".env")
 import bcrypt
 import jwt
 from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -40,7 +42,6 @@ from pydantic import BaseModel, EmailStr, Field
 
 client = AsyncIOMotorClient(os.environ["MONGO_URL"])
 db = client[os.environ["DB_NAME"]]
-app = FastAPI(title="College Event Management System")
 api = APIRouter(prefix="/api")
 JWT_ALGORITHM = "HS256"
 
@@ -49,13 +50,13 @@ JWT_ALGORITHM = "HS256"
 class RegisterInput(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     email: EmailStr
-    password: str = Field(min_length=6, max_length=100)
-    department: str = "BSc IT"
+    password: str = Field(min_length=6, max_length=72)
+    department: str = Field(default="BSc IT", max_length=80)
 
 
 class LoginInput(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=6, max_length=72)
 
 
 class EventInput(BaseModel):
@@ -67,7 +68,7 @@ class EventInput(BaseModel):
     venue: str
     capacity: int = Field(gt=0, le=10000)
     image: str = "https://images.unsplash.com/photo-1515187029135-18ee286d815b?auto=format&fit=crop&w=1200&q=80"
-    status: str = "upcoming"
+    status: Literal["upcoming", "ongoing", "completed", "cancelled"] = "upcoming"
 
 
 class CategoryInput(BaseModel):
@@ -84,12 +85,20 @@ class AnnouncementInput(BaseModel):
 class ProfileInput(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     department: str = Field(min_length=2, max_length=80)
-    phone: str = ""
+    phone: str = Field(default="", max_length=20)
 
 
 # ---------- Helpers ----------
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract real client IP handling X-Forwarded-For if behind a proxy."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def clean(doc):
@@ -100,6 +109,14 @@ def clean(doc):
     result["id"] = str(result.pop("_id", result.get("id", "")))
     result.pop("password_hash", None)
     return result
+
+
+def to_object_id(id_str: str) -> ObjectId:
+    """Convert a string to ObjectId, raising HTTP 400 on invalid format instead of crashing."""
+    try:
+        return ObjectId(id_str)
+    except (InvalidId, Exception):
+        raise HTTPException(400, "Invalid ID format")
 
 
 def hash_password(password):
@@ -128,6 +145,8 @@ async def current_user(request: Request):
         raise HTTPException(401, "Please log in to continue")
     try:
         payload = jwt.decode(token, os.environ["JWT_SECRET"], algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(401, "Invalid token type")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(401, "User not found")
@@ -158,10 +177,23 @@ async def root():
 
 
 @api.post("/auth/register")
-async def register(data: RegisterInput, response: Response):
+async def register(data: RegisterInput, response: Response, request: Request):
+    client_ip = get_client_ip(request)
+    reg_key = f"reg_limit:{client_ip}"
+    attempt = await db.login_attempts.find_one({"identifier": reg_key})
+    if attempt and attempt.get("locked_until", "") > now():
+        raise HTTPException(429, "Too many registration attempts. Please try again later")
+
     email = data.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(409, "An account with this email already exists")
+
+    count = (attempt.get("failed", 0) if attempt else 0) + 1
+    update = {"identifier": reg_key, "failed": count, "updated_at": now()}
+    if count >= 30:
+        update["locked_until"] = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    await db.login_attempts.update_one({"identifier": reg_key}, {"$set": update}, upsert=True)
+
     doc = {
         "name": data.name, "email": email,
         "password_hash": hash_password(data.password),
@@ -178,7 +210,7 @@ async def register(data: RegisterInput, response: Response):
 async def login(data: LoginInput, response: Response, request: Request):
     """Login with bcrypt check and a soft-lock after 5 failed attempts / 15 minutes."""
     user = await db.users.find_one({"email": data.email.lower()})
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     identifier = f"{client_ip}:{data.email.lower()}"
     attempt = await db.login_attempts.find_one({"identifier": identifier})
     if attempt and attempt.get("locked_until", "") > now():
@@ -234,20 +266,36 @@ async def events(search: str = "", category: str = "", status: str = "",
     if status:
         query["status"] = status
     docs = await db.events.find(query).sort("date", 1).to_list(200)
+    if not docs:
+        return []
+
+    event_ids = [str(event["_id"]) for event in docs]
+    # Batch query user registrations in a single call (solves N+1)
+    user_regs = await db.registrations.find(
+        {"event_id": {"$in": event_ids}, "user_id": str(user["_id"])}
+    ).to_list(len(event_ids))
+    registered_event_ids = {r["event_id"] for r in user_regs}
+
+    # Batch aggregate registration counts in a single call (solves N+1)
+    pipeline = [
+        {"$match": {"event_id": {"$in": event_ids}}},
+        {"$group": {"_id": "$event_id", "count": {"$sum": 1}}}
+    ]
+    counts = await db.registrations.aggregate(pipeline).to_list(len(event_ids))
+    counts_map = {c["_id"]: c["count"] for c in counts}
+
     output = []
     for event in docs:
         item = clean(event)
-        item["registered"] = bool(await db.registrations.find_one(
-            {"event_id": item["id"], "user_id": str(user["_id"])}))
-        item["registration_count"] = await db.registrations.count_documents(
-            {"event_id": item["id"]})
+        item["registered"] = item["id"] in registered_event_ids
+        item["registration_count"] = counts_map.get(item["id"], 0)
         output.append(item)
     return output
 
 
 @api.get("/events/{event_id}")
 async def event_detail(event_id: str, user=Depends(current_user)):
-    event = await db.events.find_one({"_id": ObjectId(event_id)})
+    event = await db.events.find_one({"_id": to_object_id(event_id)})
     if not event:
         raise HTTPException(404, "Event not found")
     item = clean(event)
@@ -268,7 +316,7 @@ async def create_event(data: EventInput, user=Depends(admin_only)):
 
 @api.put("/events/{event_id}")
 async def update_event(event_id: str, data: EventInput, user=Depends(admin_only)):
-    existing = await db.events.find_one({"_id": ObjectId(event_id)})
+    existing = await db.events.find_one({"_id": to_object_id(event_id)})
     if not existing:
         raise HTTPException(404, "Event not found")
     if data.status == "upcoming" and data.date < datetime.now().date().isoformat():
@@ -276,13 +324,17 @@ async def update_event(event_id: str, data: EventInput, user=Depends(admin_only)
     current_regs = await db.registrations.count_documents({"event_id": event_id})
     if data.capacity < current_regs:
         raise HTTPException(400, f"Capacity cannot be less than existing registrations ({current_regs})")
-    await db.events.update_one({"_id": ObjectId(event_id)}, {"$set": data.model_dump()})
-    return clean(await db.events.find_one({"_id": ObjectId(event_id)}))
+    update_data = data.model_dump()
+    update_data["updated_at"] = now()
+    if "created_by" in existing:
+        update_data["created_by"] = existing["created_by"]
+    await db.events.update_one({"_id": to_object_id(event_id)}, {"$set": update_data})
+    return clean(await db.events.find_one({"_id": to_object_id(event_id)}))
 
 
 @api.delete("/events/{event_id}")
 async def delete_event(event_id: str, user=Depends(admin_only)):
-    await db.events.delete_one({"_id": ObjectId(event_id)})
+    await db.events.delete_one({"_id": to_object_id(event_id)})
     await db.registrations.delete_many({"event_id": event_id})
     return {"message": "Event deleted"}
 
@@ -305,7 +357,11 @@ async def create_category(data: CategoryInput, user=Depends(admin_only)):
 
 @api.delete("/categories/{category_id}")
 async def delete_category(category_id: str, user=Depends(admin_only)):
-    await db.categories.delete_one({"_id": ObjectId(category_id)})
+    cat = await db.categories.find_one({"_id": to_object_id(category_id)})
+    if not cat:
+        raise HTTPException(404, "Category not found")
+    await db.categories.delete_one({"_id": cat["_id"]})
+    await db.events.update_many({"category": cat["name"]}, {"$set": {"category": "General"}})
     return {"message": "Category deleted"}
 
 
@@ -314,7 +370,7 @@ async def delete_category(category_id: str, user=Depends(admin_only)):
 async def register_event(event_id: str, user=Depends(current_user)):
     if user["role"] != "student":
         raise HTTPException(403, "Only students can register")
-    event = await db.events.find_one({"_id": ObjectId(event_id)})
+    event = await db.events.find_one({"_id": to_object_id(event_id)})
     if not event:
         raise HTTPException(404, "Event not found")
     if event["date"] < datetime.now().date().isoformat():
@@ -331,26 +387,14 @@ async def register_event(event_id: str, user=Depends(current_user)):
 
 @api.delete("/events/{event_id}/register")
 async def unregister_event(event_id: str, user=Depends(current_user)):
-    result = await db.registrations.delete_one(
+    reg = await db.registrations.find_one(
         {"event_id": event_id, "user_id": str(user["_id"])})
-    if not result.deleted_count:
+    if not reg:
         raise HTTPException(404, "You are not registered for this event")
+    # Clean up attendance record to prevent orphaned records
+    await db.attendance.delete_many({"registration_id": str(reg["_id"])})
+    await db.registrations.delete_one({"_id": reg["_id"]})
     return {"message": "Registration cancelled"}
-
-
-async def _decorate_registration(row):
-    event = await db.events.find_one({"_id": ObjectId(row["event_id"])})
-    student = await db.users.find_one({"_id": ObjectId(row["user_id"])})
-    attendance = await db.attendance.find_one({"registration_id": str(row["_id"])})
-    item = clean(row)
-    item.update({
-        "event_title": event.get("title", "Deleted event") if event else "Deleted event",
-        "event_date": event.get("date", "") if event else "",
-        "student_name": student.get("name", "Unknown") if student else "Unknown",
-        "student_email": student.get("email", "") if student else "",
-        "attendance": attendance.get("present") if attendance else None,
-    })
-    return item
 
 
 @api.get("/registrations")
@@ -359,7 +403,43 @@ async def registrations(event_id: str = "", user=Depends(current_user)):
     if event_id:
         query["event_id"] = event_id
     rows = await db.registrations.find(query).sort("registered_at", -1).to_list(500)
-    return [await _decorate_registration(row) for row in rows]
+    if not rows:
+        return []
+
+    event_ids = []
+    user_ids = []
+    reg_ids = []
+    for r in rows:
+        reg_ids.append(str(r["_id"]))
+        if r.get("event_id"):
+            try:
+                event_ids.append(ObjectId(r["event_id"]))
+            except Exception:
+                pass
+        if r.get("user_id"):
+            try:
+                user_ids.append(ObjectId(r["user_id"]))
+            except Exception:
+                pass
+
+    events_map = {str(e["_id"]): e for e in await db.events.find({"_id": {"$in": event_ids}}).to_list(len(event_ids))} if event_ids else {}
+    students_map = {str(u["_id"]): u for u in await db.users.find({"_id": {"$in": user_ids}}).to_list(len(user_ids))} if user_ids else {}
+    attendance_map = {a["registration_id"]: a.get("present") for a in await db.attendance.find({"registration_id": {"$in": reg_ids}}).to_list(len(reg_ids))} if reg_ids else {}
+
+    output = []
+    for row in rows:
+        item = clean(row)
+        event = events_map.get(row.get("event_id", ""))
+        student = students_map.get(row.get("user_id", ""))
+        item.update({
+            "event_title": event.get("title", "Deleted event") if event else "Deleted event",
+            "event_date": event.get("date", "") if event else "",
+            "student_name": student.get("name", "Unknown") if student else "Unknown",
+            "student_email": student.get("email", "") if student else "",
+            "attendance": attendance_map.get(str(row["_id"])),
+        })
+        output.append(item)
+    return output
 
 
 @api.patch("/registrations/{registration_id}")
@@ -367,7 +447,7 @@ async def registration_status(registration_id: str, status: str, user=Depends(ad
     if status not in ["approved", "rejected", "pending"]:
         raise HTTPException(400, "Invalid status")
     result = await db.registrations.update_one(
-        {"_id": ObjectId(registration_id)}, {"$set": {"status": status}})
+        {"_id": to_object_id(registration_id)}, {"$set": {"status": status}})
     if not result.matched_count:
         raise HTTPException(404, "Registration not found")
     return {"message": "Registration updated"}
@@ -375,7 +455,7 @@ async def registration_status(registration_id: str, status: str, user=Depends(ad
 
 @api.post("/registrations/{registration_id}/attendance")
 async def attendance(registration_id: str, present: bool, user=Depends(admin_only)):
-    registration = await db.registrations.find_one({"_id": ObjectId(registration_id)})
+    registration = await db.registrations.find_one({"_id": to_object_id(registration_id)})
     if not registration:
         raise HTTPException(404, "Registration not found")
     if registration.get("status") != "approved":
@@ -393,16 +473,47 @@ async def attendance(registration_id: str, present: bool, user=Depends(admin_onl
 async def certificates(user=Depends(current_user)):
     """Return certificates the caller is allowed to see (admin: all, student: own)."""
     rows = await db.attendance.find({"present": True}).to_list(1000)
+    if not rows:
+        return []
+
+    reg_obj_ids = []
+    for row in rows:
+        try:
+            reg_obj_ids.append(ObjectId(row["registration_id"]))
+        except Exception:
+            pass
+
+    reg_query = {"_id": {"$in": reg_obj_ids}}
+    if user["role"] != "admin":
+        reg_query["user_id"] = str(user["_id"])
+
+    registrations_found = await db.registrations.find(reg_query).to_list(len(reg_obj_ids))
+    registrations_map = {str(r["_id"]): r for r in registrations_found}
+
+    event_ids = []
+    user_ids = []
+    for r in registrations_found:
+        if r.get("event_id"):
+            try:
+                event_ids.append(ObjectId(r["event_id"]))
+            except Exception:
+                pass
+        if r.get("user_id"):
+            try:
+                user_ids.append(ObjectId(r["user_id"]))
+            except Exception:
+                pass
+
+    events_map = {str(e["_id"]): e for e in await db.events.find({"_id": {"$in": event_ids}}).to_list(len(event_ids))} if event_ids else {}
+    students_map = {str(u["_id"]): u for u in await db.users.find({"_id": {"$in": user_ids}}).to_list(len(user_ids))} if user_ids else {}
+
     output = []
     for row in rows:
-        reg_query = {"_id": ObjectId(row["registration_id"])}
-        if user["role"] != "admin":
-            reg_query["user_id"] = str(user["_id"])
-        registration = await db.registrations.find_one(reg_query)
+        registration = registrations_map.get(row["registration_id"])
         if not registration:
             continue
-        event = await db.events.find_one({"_id": ObjectId(registration["event_id"])})
-        student = await db.users.find_one({"_id": ObjectId(registration["user_id"])})
+        event = events_map.get(registration.get("event_id"))
+        student = students_map.get(registration.get("user_id"))
         output.append({
             "id": str(row["_id"]),
             "registration_id": row["registration_id"],
@@ -417,7 +528,7 @@ async def certificates(user=Depends(current_user)):
 @api.get("/certificates/{registration_id}/download", response_class=HTMLResponse)
 async def download_certificate(registration_id: str, user=Depends(current_user)):
     """Return a printable HTML certificate for an eligible participant."""
-    registration = await db.registrations.find_one({"_id": ObjectId(registration_id)})
+    registration = await db.registrations.find_one({"_id": to_object_id(registration_id)})
     if not registration:
         raise HTTPException(404, "Registration not found")
     if user["role"] != "admin" and registration["user_id"] != str(user["_id"]):
@@ -426,8 +537,8 @@ async def download_certificate(registration_id: str, user=Depends(current_user))
         {"registration_id": registration_id, "present": True})
     if not attendance:
         raise HTTPException(400, "Certificate is available only after attendance is marked")
-    event = await db.events.find_one({"_id": ObjectId(registration["event_id"])})
-    student = await db.users.find_one({"_id": ObjectId(registration["user_id"])})
+    event = await db.events.find_one({"_id": to_object_id(registration["event_id"])})
+    student = await db.users.find_one({"_id": to_object_id(registration["user_id"])})
     # Escape user-provided strings to prevent HTML injection in certificate output.
     safe_name = html.escape(student["name"])
     safe_dept = html.escape(student.get("department", ""))
@@ -488,7 +599,7 @@ async def create_announcement(data: AnnouncementInput, user=Depends(admin_only))
 
 @api.delete("/announcements/{announcement_id}")
 async def delete_announcement(announcement_id: str, user=Depends(admin_only)):
-    await db.announcements.delete_one({"_id": ObjectId(announcement_id)})
+    await db.announcements.delete_one({"_id": to_object_id(announcement_id)})
     return {"message": "Announcement deleted"}
 
 
@@ -503,7 +614,7 @@ async def users(user=Depends(admin_only)):
 async def change_role(user_id: str, role: str, user=Depends(admin_only)):
     if role not in ["admin", "student"]:
         raise HTTPException(400, "Invalid role")
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"role": role}})
+    await db.users.update_one({"_id": to_object_id(user_id)}, {"$set": {"role": role}})
     return {"message": "Role updated"}
 
 
@@ -511,8 +622,14 @@ async def change_role(user_id: str, role: str, user=Depends(admin_only)):
 async def delete_user(user_id: str, user=Depends(admin_only)):
     if str(user["_id"]) == user_id:
         raise HTTPException(400, "You cannot delete your own account")
-    await db.users.delete_one({"_id": ObjectId(user_id)})
+    
+    # Cascade delete registrations and their associated attendance
+    user_regs = await db.registrations.find({"user_id": user_id}).to_list(1000)
+    reg_ids = [str(r["_id"]) for r in user_regs]
+    if reg_ids:
+        await db.attendance.delete_many({"registration_id": {"$in": reg_ids}})
     await db.registrations.delete_many({"user_id": user_id})
+    await db.users.delete_one({"_id": to_object_id(user_id)})
     return {"message": "User deleted"}
 
 
@@ -532,29 +649,46 @@ async def update_profile(data: ProfileInput, user=Depends(current_user)):
 async def report_events(user=Depends(admin_only)):
     """Event-wise counts: registrations, approved, attended, capacity."""
     events_list = await db.events.find().sort("date", -1).to_list(500)
+    if not events_list:
+        return []
+
+    # Aggregate registrations per event
+    reg_pipeline = [
+        {"$group": {
+            "_id": "$event_id",
+            "total": {"$sum": 1},
+            "approved": {"$sum": {"$cond": [{"$eq": ["$status", "approved"]}, 1, 0]}},
+            "pending": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, 1, 0]}},
+            "reg_ids": {"$push": {"$toString": "$_id"}}
+        }}
+    ]
+    reg_stats = {r["_id"]: r for r in await db.registrations.aggregate(reg_pipeline).to_list(1000)}
+
+    # Fetch set of attended registration IDs
+    attended_regs = await db.attendance.find({"present": True}).to_list(5000)
+    attended_set = {a["registration_id"] for a in attended_regs}
+
     report = []
     for event in events_list:
         eid = str(event["_id"])
-        total = await db.registrations.count_documents({"event_id": eid})
-        approved = await db.registrations.count_documents({"event_id": eid, "status": "approved"})
-        pending = await db.registrations.count_documents({"event_id": eid, "status": "pending"})
-        registrations_of = await db.registrations.find({"event_id": eid}).to_list(1000)
-        reg_ids = [str(r["_id"]) for r in registrations_of]
-        attended = await db.attendance.count_documents(
-            {"registration_id": {"$in": reg_ids}, "present": True}) if reg_ids else 0
+        stats = reg_stats.get(eid, {})
+        reg_ids = stats.get("reg_ids", [])
+        attended_count = sum(1 for rid in reg_ids if rid in attended_set)
         report.append({
             "id": eid, "title": event["title"], "category": event.get("category", ""),
             "date": event.get("date", ""), "capacity": event.get("capacity", 0),
             "status": event.get("status", ""),
-            "registrations": total, "approved": approved,
-            "pending": pending, "attended": attended,
+            "registrations": stats.get("total", 0),
+            "approved": stats.get("approved", 0),
+            "pending": stats.get("pending", 0),
+            "attended": attended_count,
         })
     return report
 
 
-# ---------- Startup: indexes + demo seed ----------
-@app.on_event("startup")
-async def startup():
+# ---------- Startup: indexes + demo seed (lifespan) ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await db.users.create_index("email", unique=True)
     await db.categories.create_index("name", unique=True)
     await db.registrations.create_index([("event_id", 1), ("user_id", 1)], unique=True)
@@ -599,13 +733,15 @@ async def startup():
              "capacity": 60, "image": "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1200&q=80",
              "status": "upcoming", "created_at": now()},
         ])
+    yield
 
 
-app.include_router(api)
+app = FastAPI(title="College Event Management System", lifespan=lifespan)
 cors_origins = [origin.strip() for origin in os.environ.get(
-    "CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware, allow_credentials=True,
     allow_origins=cors_origins,
     allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(api)

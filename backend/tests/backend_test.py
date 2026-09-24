@@ -366,6 +366,67 @@ class TestLockout:
         assert codes[5] == 429, codes
 
 
+class TestEdgeCases:
+    def test_api_root(self):
+        r = requests.get(f"{BASE}/")
+        assert r.status_code == 200
+        assert "message" in r.json()
+
+    def test_invalid_object_id_returns_400(self, admin):
+        r = admin.get(f"{BASE}/events/invalid-id-xyz")
+        assert r.status_code == 400
+        assert "Invalid ID format" in r.text
+
+    def test_invalid_event_status_rejected(self, admin):
+        payload = {
+            "title": "Invalid Status Test",
+            "description": "Valid description length test",
+            "category": "Technology",
+            "date": "2027-01-01",
+            "time": "10:00",
+            "venue": "Lab 1",
+            "capacity": 50,
+            "status": "not-a-valid-status",
+        }
+        r = admin.post(f"{BASE}/events", json=payload)
+        assert r.status_code == 422
+
+    def test_password_over_72_chars_rejected(self):
+        s = _client()
+        too_long_pw = "a" * 73
+        r = s.post(f"{BASE}/auth/register", json={
+            "name": "Long Password",
+            "email": f"TEST_pw_{uuid.uuid4().hex[:6]}@campus.edu",
+            "password": too_long_pw,
+            "department": "BSc IT",
+        })
+        assert r.status_code == 422
+
+    def test_admin_cannot_register_for_event(self, admin):
+        # Create a test event first
+        evt = admin.post(f"{BASE}/events", json={
+            "title": f"TEST_adm_reg_{uuid.uuid4().hex[:6]}",
+            "description": "Admin cannot register test event description",
+            "category": "Technology",
+            "date": "2027-10-10",
+            "time": "12:00",
+            "venue": "Hall B",
+            "capacity": 50,
+            "status": "upcoming",
+        }).json()
+        r = admin.post(f"{BASE}/events/{evt['id']}/register")
+        assert r.status_code == 403
+        admin.delete(f"{BASE}/events/{evt['id']}")
+
+    def test_phone_max_length_profile(self, student):
+        r = student.put(f"{BASE}/profile", json={
+            "name": "Student A",
+            "department": "BSc IT",
+            "phone": "1" * 25,
+        })
+        assert r.status_code == 422
+
+
 def test_zz_cleanup(admin):
     for e in admin.get(f"{BASE}/events").json():
         if e["title"].startswith("TEST_"):

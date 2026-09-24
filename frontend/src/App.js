@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { Component, useEffect, useState, useCallback } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import axios from "axios";
 import {
@@ -10,6 +10,45 @@ import "@/App.css";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const api = axios.create({ baseURL: API, withCredentials: true });
+
+let onUnauthorizedCallback = null;
+const registerUnauthorizedHandler = (cb) => { onUnauthorizedCallback = cb; };
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401 && onUnauthorizedCallback) {
+      onUnauthorizedCallback();
+    }
+    return Promise.reject(error);
+  }
+);
+
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, errorInfo) {
+    console.error("ErrorBoundary caught:", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
+          <h2 style={{ color: "#0f172a", marginBottom: "8px" }}>Something went wrong</h2>
+          <p style={{ marginBottom: "16px" }}>An unexpected error occurred. Please refresh the page.</p>
+          <button className="primary" onClick={() => window.location.reload()}>Refresh</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const errorText = (e) => {
   const d = e?.response?.data?.detail;
   return Array.isArray(d) ? d.map((x) => x.msg).join(" ") : d || "Something went wrong.";
@@ -35,8 +74,8 @@ function Auth({ onAuth }) {
         <h1>Make every<br /><em>moment</em> count.</h1>
         <p>One calm workspace for the events that bring your college community together.</p>
         <div className="auth-stats">
-          <span><strong>24</strong> active events</span>
-          <span><strong>1.8k</strong> students connected</span>
+          <span><strong>Campus</strong> Connected</span>
+          <span><strong>Events</strong> Real-time</span>
         </div>
       </section>
       <section className="auth-panel">
@@ -47,7 +86,19 @@ function Auth({ onAuth }) {
           <p className="muted">{mode === "login" ? "Pick up where your campus story left off." : "Student accounts are ready in a few moments."}</p>
           <form onSubmit={submit}>
             {mode !== "login" && (
-              <label>Full name<input data-testid="register-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /></label>
+              <>
+                <label>Full name<input data-testid="register-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /></label>
+                <label>Department
+                  <select data-testid="register-department-input" value={form.department} onChange={(e) => setForm({ ...form, department: e.target.value })} required>
+                    <option value="BSc IT">BSc IT</option>
+                    <option value="Computer Science">Computer Science</option>
+                    <option value="Information Technology">Information Technology</option>
+                    <option value="Engineering">Engineering</option>
+                    <option value="Management">Management</option>
+                    <option value="Commerce">Commerce</option>
+                  </select>
+                </label>
+              </>
             )}
             <label>College email<input data-testid="auth-email-input" type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} required /></label>
             <label>Password<input data-testid="auth-password-input" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required /></label>
@@ -171,9 +222,23 @@ function Overview({ user, go }) {
   const [stats, setStats] = useState(null);
   const [events, setEvents] = useState([]);
   const [ann, setAnn] = useState([]);
+  const [loading, setLoading] = useState(true);
+
   useEffect(() => {
+    let mounted = true;
     Promise.all([api.get("/dashboard"), api.get("/events"), api.get("/announcements")])
-      .then(([s, e, a]) => { setStats(s.data); setEvents(e.data); setAnn(a.data); });
+      .then(([s, e, a]) => {
+        if (mounted) {
+          setStats(s.data);
+          setEvents(e.data);
+          setAnn(a.data);
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (mounted) setLoading(false);
+      });
+    return () => { mounted = false; };
   }, []);
   const cards = [
     ["Total events", stats?.total_events, "Across all categories", CalendarDays, "teal"],
@@ -243,12 +308,15 @@ function Events({ user }) {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(emptyEvent);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
+    setLoading(true);
     const qs = new URLSearchParams({ search, category, status }).toString();
     return Promise.all([api.get(`/events?${qs}`), api.get("/categories")])
       .then(([e, c]) => { setEvents(e.data); setCats(c.data); })
-      .catch(() => setError("Events could not be loaded."));
+      .catch(() => setError("Events could not be loaded."))
+      .finally(() => setLoading(false));
   }, [search, category, status]);
   useEffect(() => { load(); }, [load]);
 
@@ -292,41 +360,45 @@ function Events({ user }) {
           <option value="completed">Completed</option>
         </select>
       </div>
-      <div className="event-grid">
-        {events.map((e) => (
-          <article key={e.id} data-testid={`event-card-${e.id}`} className="event-card">
-            <div className="event-image">
-              <img src={e.image} alt="" /><span>{e.category}</span>
-            </div>
-            <div className="event-body">
-              <div className="event-date">
-                <b>{new Date(e.date).toLocaleDateString("en-IN", { day: "2-digit" })}</b>
-                <small>{new Date(e.date).toLocaleDateString("en-IN", { month: "short" })}</small>
+      {loading ? (
+        <div style={{ padding: "40px", textAlign: "center", color: "var(--muted)" }}>Loading events…</div>
+      ) : (
+        <div className="event-grid">
+          {events.map((e) => (
+            <article key={e.id} data-testid={`event-card-${e.id}`} className="event-card">
+              <div className="event-image">
+                <img src={e.image} alt="" /><span>{e.category}</span>
               </div>
-              <div className="event-info">
-                <h3>{e.title}</h3>
-                <p>{e.description}</p>
-                <small>{e.time} · {e.venue}</small>
-              </div>
-            </div>
-            <div className="event-footer">
-              <span><Users size={14} /> {e.registration_count}/{e.capacity}</span>
-              {user.role === "student" && (
-                <button data-testid={`event-register-${e.id}`} className={e.registered ? "outline success" : "primary small"} onClick={() => toggleReg(e)}>
-                  {e.registered ? "Registered" : "Register"}
-                </button>
-              )}
-              {user.role === "admin" && (
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button data-testid={`event-edit-${e.id}`} className="icon-button" onClick={() => openEdit(e)}><Edit3 size={16} /></button>
-                  <button data-testid={`event-delete-${e.id}`} className="icon-button danger" onClick={async () => { if (window.confirm("Delete this event?")) { await api.delete(`/events/${e.id}`); load(); } }}><Trash2 size={16} /></button>
+              <div className="event-body">
+                <div className="event-date">
+                  <b>{new Date(e.date).toLocaleDateString("en-IN", { day: "2-digit" })}</b>
+                  <small>{new Date(e.date).toLocaleDateString("en-IN", { month: "short" })}</small>
                 </div>
-              )}
-            </div>
-          </article>
-        ))}
-      </div>
-      {!events.length && <Empty text="No events match your filters" />}
+                <div className="event-info">
+                  <h3>{e.title}</h3>
+                  <p>{e.description}</p>
+                  <small>{e.time} · {e.venue}</small>
+                </div>
+              </div>
+              <div className="event-footer">
+                <span><Users size={14} /> {e.registration_count}/{e.capacity}</span>
+                {user.role === "student" && (
+                  <button data-testid={`event-register-${e.id}`} className={e.registered ? "outline success" : "primary small"} onClick={() => toggleReg(e)}>
+                    {e.registered ? "Registered" : "Register"}
+                  </button>
+                )}
+                {user.role === "admin" && (
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button data-testid={`event-edit-${e.id}`} className="icon-button" onClick={() => openEdit(e)}><Edit3 size={16} /></button>
+                    <button data-testid={`event-delete-${e.id}`} className="icon-button danger" onClick={async () => { if (window.confirm("Delete this event?")) { await api.delete(`/events/${e.id}`); load(); } }}><Trash2 size={16} /></button>
+                  </div>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+      {!loading && !events.length && <Empty text="No events match your filters" />}
       {error && <div className="error toast-error">{error}</div>}
       {show && (
         <Modal title={editing ? "Edit event" : "Create a new event"} close={() => setShow(false)}>
@@ -363,8 +435,16 @@ function Events({ user }) {
 function Registrations({ user }) {
   const [rows, setRows] = useState([]);
   const [busy, setBusy] = useState(false);
-  const load = useCallback(() => api.get("/registrations").then((r) => setRows(r.data)), []);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    return api.get("/registrations")
+      .then((r) => setRows(r.data))
+      .finally(() => setLoading(false));
+  }, []);
   useEffect(() => { load(); }, [load]);
+
   const update = async (id, status) => { setBusy(true); await api.patch(`/registrations/${id}?status=${status}`); await load(); setBusy(false); };
   const mark = async (id, present) => { setBusy(true); try { await api.post(`/registrations/${id}/attendance?present=${present}`); await load(); } catch (e) { alert(errorText(e)); } setBusy(false); };
   const unreg = async (event_id) => { if (window.confirm("Cancel this registration?")) { await api.delete(`/events/${event_id}/register`); load(); } };
@@ -385,34 +465,38 @@ function Registrations({ user }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => (
-              <tr key={r.id} data-testid={`registration-row-${r.id}`}>
-                {isAdmin && <td><b>{r.student_name}</b><small>{r.student_email}</small></td>}
-                <td><b>{r.event_title}</b><small>{fmtDate(r.event_date)}</small></td>
-                <td>{fmtDate(r.registered_at)}</td>
-                <td><span className={`status ${r.status}`}>{r.status}</span></td>
-                <td>
-                  {r.attendance === true && <span className="status approved">Present</span>}
-                  {r.attendance === false && <span className="status rejected">Absent</span>}
-                  {r.attendance === null && <span className="status pending">Not marked</span>}
-                </td>
-                <td>
-                  {isAdmin ? (
-                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                      <button data-testid={`approve-registration-${r.id}`} className="icon-button success" title="Approve" disabled={busy} onClick={() => update(r.id, "approved")}><CheckCircle2 size={17} /></button>
-                      <button data-testid={`reject-registration-${r.id}`} className="icon-button danger" title="Reject" disabled={busy} onClick={() => update(r.id, "rejected")}><XCircle size={17} /></button>
-                      <button data-testid={`present-registration-${r.id}`} className="outline" title="Mark present" disabled={busy || r.status !== "approved"} onClick={() => mark(r.id, true)}>Present</button>
-                      <button data-testid={`absent-registration-${r.id}`} className="outline" title="Mark absent" disabled={busy || r.status !== "approved"} onClick={() => mark(r.id, false)}>Absent</button>
-                    </div>
-                  ) : (
-                    <button data-testid={`unregister-${r.id}`} className="outline" onClick={() => unreg(r.event_id)}>Unregister</button>
-                  )}
-                </td>
-              </tr>
-            ))}
+            {loading ? (
+              <tr><td colSpan={6} style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Loading registrations…</td></tr>
+            ) : (
+              rows.map((r) => (
+                <tr key={r.id} data-testid={`registration-row-${r.id}`}>
+                  {isAdmin && <td><b>{r.student_name}</b><small>{r.student_email}</small></td>}
+                  <td><b>{r.event_title}</b><small>{fmtDate(r.event_date)}</small></td>
+                  <td>{fmtDate(r.registered_at)}</td>
+                  <td><span className={`status ${r.status}`}>{r.status}</span></td>
+                  <td>
+                    {r.attendance === true && <span className="status approved">Present</span>}
+                    {r.attendance === false && <span className="status rejected">Absent</span>}
+                    {r.attendance === null && <span className="status pending">Not marked</span>}
+                  </td>
+                  <td>
+                    {isAdmin ? (
+                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                        <button data-testid={`approve-registration-${r.id}`} className="icon-button success" title="Approve" disabled={busy} onClick={() => update(r.id, "approved")}><CheckCircle2 size={17} /></button>
+                        <button data-testid={`reject-registration-${r.id}`} className="icon-button danger" title="Reject" disabled={busy} onClick={() => update(r.id, "rejected")}><XCircle size={17} /></button>
+                        <button data-testid={`present-registration-${r.id}`} className="outline" title="Mark present" disabled={busy || r.status !== "approved"} onClick={() => mark(r.id, true)}>Present</button>
+                        <button data-testid={`absent-registration-${r.id}`} className="outline" title="Mark absent" disabled={busy || r.status !== "approved"} onClick={() => mark(r.id, false)}>Absent</button>
+                      </div>
+                    ) : (
+                      <button data-testid={`unregister-${r.id}`} className="outline" onClick={() => unreg(r.event_id)}>Unregister</button>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
-        {!rows.length && <Empty text={isAdmin ? "No registrations to review" : "You haven't registered for any event yet"} />}
+        {!loading && !rows.length && <Empty text={isAdmin ? "No registrations to review" : "You haven't registered for any event yet"} />}
       </div>
     </Page>
   );
@@ -421,7 +505,14 @@ function Registrations({ user }) {
 /* --------------------------- Certificates ------------------------------ */
 function Certificates() {
   const [rows, setRows] = useState([]);
-  useEffect(() => { api.get("/certificates").then((r) => setRows(r.data)); }, []);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.get("/certificates")
+      .then((r) => setRows(r.data))
+      .finally(() => setLoading(false));
+  }, []);
+
   const download = (registration_id) => {
     window.open(`${API}/certificates/${registration_id}/download`, "_blank");
   };
@@ -431,18 +522,22 @@ function Certificates() {
         <table>
           <thead><tr><th>Event</th><th>Held on</th><th>Participant</th><th>Issued</th><th></th></tr></thead>
           <tbody>
-            {rows.map((r) => (
-              <tr key={r.id} data-testid={`certificate-row-${r.registration_id}`}>
-                <td><b>{r.event_title}</b></td>
-                <td>{fmtDate(r.event_date)}</td>
-                <td>{r.student_name}</td>
-                <td>{fmtDate(r.issued_at)}</td>
-                <td><button data-testid={`certificate-download-${r.registration_id}`} className="primary small" onClick={() => download(r.registration_id)}><Download size={14} /> Download</button></td>
-              </tr>
-            ))}
+            {loading ? (
+              <tr><td colSpan={5} style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Loading certificates…</td></tr>
+            ) : (
+              rows.map((r) => (
+                <tr key={r.id} data-testid={`certificate-row-${r.registration_id}`}>
+                  <td><b>{r.event_title}</b></td>
+                  <td>{fmtDate(r.event_date)}</td>
+                  <td>{r.student_name}</td>
+                  <td>{fmtDate(r.issued_at)}</td>
+                  <td><button data-testid={`certificate-download-${r.registration_id}`} className="primary small" onClick={() => download(r.registration_id)}><Download size={14} /> Download</button></td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
-        {!rows.length && <Empty text="Certificates appear here after attendance is marked" />}
+        {!loading && !rows.length && <Empty text="Certificates appear here after attendance is marked" />}
       </div>
     </Page>
   );
@@ -454,7 +549,15 @@ function Announcements({ user }) {
   const [show, setShow] = useState(false);
   const [form, setForm] = useState({ title: "", message: "" });
   const [error, setError] = useState("");
-  const load = useCallback(() => api.get("/announcements").then((r) => setItems(r.data)).catch(() => setError("Announcements could not be loaded.")), []);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    return api.get("/announcements")
+      .then((r) => setItems(r.data))
+      .catch(() => setError("Announcements could not be loaded."))
+      .finally(() => setLoading(false));
+  }, []);
   useEffect(() => { load(); }, [load]);
   const save = async (e) => {
     e.preventDefault();
@@ -467,7 +570,8 @@ function Announcements({ user }) {
       action={user.role === "admin" && <button data-testid="create-announcement-button" className="primary" onClick={() => setShow(true)}><Plus size={17} /> New announcement</button>}>
       <div className="announcement-list">
         {error && <div data-testid="announcements-error" className="error">{error}</div>}
-        {items.map((a) => (
+        {loading && <div style={{ padding: 30, textAlign: "center", color: "var(--muted)" }}>Loading announcements…</div>}
+        {!loading && items.map((a) => (
           <div key={a.id} data-testid={`announcement-item-${a.id}`} className="announcement large">
             <div className="announcement-dot" />
             <div style={{ flex: 1 }}>
@@ -483,7 +587,7 @@ function Announcements({ user }) {
             </div>
           </div>
         ))}
-        {!items.length && !error && <Empty text="Announcements from your team will appear here" />}
+        {!loading && !items.length && !error && <Empty text="Announcements from your team will appear here" />}
       </div>
       {show && (
         <Modal title="Share an announcement" close={() => setShow(false)}>
@@ -504,7 +608,14 @@ function Categories() {
   const [show, setShow] = useState(false);
   const [form, setForm] = useState({ name: "", description: "" });
   const [error, setError] = useState("");
-  const load = () => api.get("/categories").then((r) => setRows(r.data));
+  const [loading, setLoading] = useState(true);
+
+  const load = () => {
+    setLoading(true);
+    return api.get("/categories")
+      .then((r) => setRows(r.data))
+      .finally(() => setLoading(false));
+  };
   useEffect(() => { load(); }, []);
   const save = async (e) => {
     e.preventDefault();
@@ -520,16 +631,20 @@ function Categories() {
         <table>
           <thead><tr><th>Name</th><th>Description</th><th></th></tr></thead>
           <tbody>
-            {rows.map((c) => (
-              <tr key={c.id} data-testid={`category-row-${c.id}`}>
-                <td><b>{c.name}</b></td>
-                <td>{c.description || <span className="muted">—</span>}</td>
-                <td><button data-testid={`category-delete-${c.id}`} className="icon-button danger" onClick={() => del(c.id)}><Trash2 size={16} /></button></td>
-              </tr>
-            ))}
+            {loading ? (
+              <tr><td colSpan={3} style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Loading categories…</td></tr>
+            ) : (
+              rows.map((c) => (
+                <tr key={c.id} data-testid={`category-row-${c.id}`}>
+                  <td><b>{c.name}</b></td>
+                  <td>{c.description || <span className="muted">—</span>}</td>
+                  <td><button data-testid={`category-delete-${c.id}`} className="icon-button danger" onClick={() => del(c.id)}><Trash2 size={16} /></button></td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
-        {!rows.length && <Empty text="No categories yet" />}
+        {!loading && !rows.length && <Empty text="No categories yet" />}
       </div>
       {show && (
         <Modal title="New category" close={() => setShow(false)}>
@@ -548,7 +663,14 @@ function Categories() {
 /* ------------------------------ People --------------------------------- */
 function People({ user }) {
   const [rows, setRows] = useState([]);
-  const load = () => api.get("/users").then((r) => setRows(r.data));
+  const [loading, setLoading] = useState(true);
+
+  const load = () => {
+    setLoading(true);
+    return api.get("/users")
+      .then((r) => setRows(r.data))
+      .finally(() => setLoading(false));
+  };
   useEffect(() => { load(); }, []);
   const changeRole = async (id, role) => { await api.patch(`/users/${id}/role?role=${role}`); load(); };
   const del = async (id) => { if (window.confirm("Delete this user? All their registrations will be removed.")) { try { await api.delete(`/users/${id}`); load(); } catch (e) { alert(errorText(e)); } } };
@@ -558,23 +680,27 @@ function People({ user }) {
         <table>
           <thead><tr><th>Name</th><th>Email</th><th>Department</th><th>Role</th><th></th></tr></thead>
           <tbody>
-            {rows.map((u) => (
-              <tr key={u.id} data-testid={`user-row-${u.id}`}>
-                <td><b>{u.name}</b></td>
-                <td>{u.email}</td>
-                <td>{u.department}</td>
-                <td>
-                  <select data-testid={`user-role-select-${u.id}`} value={u.role} disabled={u.id === user.id} onChange={(e) => changeRole(u.id, e.target.value)}>
-                    <option value="admin">Admin</option>
-                    <option value="student">Student</option>
-                  </select>
-                </td>
-                <td>{u.id !== user.id && <button data-testid={`user-delete-${u.id}`} className="icon-button danger" onClick={() => del(u.id)}><Trash2 size={16} /></button>}</td>
-              </tr>
-            ))}
+            {loading ? (
+              <tr><td colSpan={5} style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Loading users…</td></tr>
+            ) : (
+              rows.map((u) => (
+                <tr key={u.id} data-testid={`user-row-${u.id}`}>
+                  <td><b>{u.name}</b></td>
+                  <td>{u.email}</td>
+                  <td>{u.department}</td>
+                  <td>
+                    <select data-testid={`user-role-select-${u.id}`} value={u.role} disabled={u.id === user.id} onChange={(e) => changeRole(u.id, e.target.value)}>
+                      <option value="admin">Admin</option>
+                      <option value="student">Student</option>
+                    </select>
+                  </td>
+                  <td>{u.id !== user.id && <button data-testid={`user-delete-${u.id}`} className="icon-button danger" onClick={() => del(u.id)}><Trash2 size={16} /></button>}</td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
-        {!rows.length && <Empty text="No users yet" />}
+        {!loading && !rows.length && <Empty text="No users yet" />}
       </div>
     </Page>
   );
@@ -585,7 +711,13 @@ function Reports() {
   const [rows, setRows] = useState([]);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
-  useEffect(() => { api.get("/reports/events").then((r) => setRows(r.data)); }, []);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.get("/reports/events")
+      .then((r) => setRows(r.data))
+      .finally(() => setLoading(false));
+  }, []);
   const filtered = rows.filter((r) => (!from || r.date >= from) && (!to || r.date <= to));
   const totals = filtered.reduce((a, r) => ({ registrations: a.registrations + r.registrations, attended: a.attended + r.attended, capacity: a.capacity + r.capacity }), { registrations: 0, attended: 0, capacity: 0 });
   return (
@@ -604,21 +736,25 @@ function Reports() {
         <table>
           <thead><tr><th>Event</th><th>Category</th><th>Date</th><th>Registrations</th><th>Approved</th><th>Pending</th><th>Attended</th><th>Fill %</th></tr></thead>
           <tbody>
-            {filtered.map((r) => (
-              <tr key={r.id} data-testid={`report-row-${r.id}`}>
-                <td><b>{r.title}</b></td>
-                <td>{r.category}</td>
-                <td>{fmtDate(r.date)}</td>
-                <td>{r.registrations}</td>
-                <td>{r.approved}</td>
-                <td>{r.pending}</td>
-                <td>{r.attended}</td>
-                <td>{r.capacity ? Math.round((r.registrations / r.capacity) * 100) : 0}%</td>
-              </tr>
-            ))}
+            {loading ? (
+              <tr><td colSpan={8} style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Loading report…</td></tr>
+            ) : (
+              filtered.map((r) => (
+                <tr key={r.id} data-testid={`report-row-${r.id}`}>
+                  <td><b>{r.title}</b></td>
+                  <td>{r.category}</td>
+                  <td>{fmtDate(r.date)}</td>
+                  <td>{r.registrations}</td>
+                  <td>{r.approved}</td>
+                  <td>{r.pending}</td>
+                  <td>{r.attended}</td>
+                  <td>{r.capacity ? Math.round((r.registrations / r.capacity) * 100) : 0}%</td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
-        {!filtered.length && <Empty text="No events match the selected range" />}
+        {!loading && !filtered.length && <Empty text="No events match the selected range" />}
       </div>
     </Page>
   );
@@ -679,17 +815,24 @@ function App() {
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(true);
   const refresh = useCallback(() => api.get("/auth/me").then((r) => setUser(r.data)).catch(() => {}), []);
+
+  useEffect(() => {
+    registerUnauthorizedHandler(() => setUser(null));
+  }, []);
+
   useEffect(() => { refresh().finally(() => setChecking(false)); }, [refresh]);
   if (checking) return <div className="loading-screen">Loading your workspace…</div>;
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={
-          user ? <AppShell user={user} refresh={refresh} onLogout={async () => { await api.post("/auth/logout"); setUser(null); }} /> : <Auth onAuth={setUser} />
-        } />
-        <Route path="*" element={<Navigate to="/" />} />
-      </Routes>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={
+            user ? <AppShell user={user} refresh={refresh} onLogout={async () => { await api.post("/auth/logout"); setUser(null); }} /> : <Auth onAuth={setUser} />
+          } />
+          <Route path="*" element={<Navigate to="/" />} />
+        </Routes>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }
 export default App;
