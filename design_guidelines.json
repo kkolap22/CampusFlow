@@ -1,0 +1,84 @@
+{
+  "typography": {
+    "headings": "Outfit, sans-serif",
+    "body": "Plus Jakarta Sans, sans-serif",
+    "weights": {
+      "light": 300,
+      "regular": 400,
+      "medium": 500,
+      "semibold": 600,
+      "bold": 700
+    }
+  },
+  "colors": {
+    "archetype": "ORGANIC & EARTHY / ACADEMIC PROFESSIONAL",
+    "primary": "#4F46E5",
+    "primary_hover": "#4338CA",
+    "accent": "#06B6D4",
+    "background": "#F8FAFC",
+    "surface": "#FFFFFF",
+    "text_primary": "#0F172A",
+    "text_secondary": "#475569",
+    "border": "#E2E8F0"
+  },
+  "visual_enhancers": {
+    "border_radius": "0.75rem",
+    "shadows": [
+      "0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06)",
+      "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)"
+    ],
+    "glassmorphism": "backdrop-blur-xl bg-white/80 border border-slate-200/80"
+  },
+  "component_name": "College Event Management System",
+  "grids": {
+    "dashboard_grid": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6",
+    "event_grid": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+  },
+  "layouts": {
+    "sidebar_layout": "flex h-screen bg-slate-50 overflow-hidden",
+    "main_content": "flex-1 flex flex-col overflow-y-auto"
+  },
+  "motion": {
+    "hover_transition": "transition-all duration-200 ease-in-out",
+    "modal_animation": "animate-in fade-in zoom-in-95 duration-200"
+  },
+  "accessibility": {
+    "contrast_ratio_min": "4.5:1",
+    "focus_ring": "focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+  },
+  "media": {
+    "hero_image_max_height": "70vh"
+  },
+  "3d_libraries": {
+    "enabled": false
+  },
+  "image_urls": [
+    {
+      "category": "events",
+      "description": "Tech Hackathon Event",
+      "image_url": "https://images.unsplash.com/photo-1515187029135-18ee286d815b?auto=format&fit=crop&w=800&q=80"
+    },
+    {
+      "category": "events",
+      "description": "Cultural Fest Dance",
+      "image_url": "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?auto=format&fit=crop&w=800&q=80"
+    },
+    {
+      "category": "events",
+      "description": "Sports Meet Athletics",
+      "image_url": "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?auto=format&fit=crop&w=800&q=80"
+    },
+    {
+      "category": "events",
+      "description": "Coding Workshop",
+      "image_url": "https://images.unsplash.com/photo-1531482615713-2afd69097998?auto=format&fit=crop&w=800&q=80"
+    }
+  ],
+  "instructions_to_main_agent": "Build a robust full-stack College Event Management System with backend (Python FastAPI, SQLite/SQLAlchemy) and frontend (React, Tailwind CSS, Lucide icons, React Router). Implement Authentication (JWT, Admin & Student roles), Admin Dashboard with statistics, Event CRUD, Category CRUD, Student/Participant Management, Event Registration with capacity validation and date/duplicate checks, Attendance marking, Certificate generation/download, Announcements, Search/Filters, Reports, Profile management, and User Management. Ensure all interactive elements have data-testid attributes.",
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Ensure all interactive elements have data-testid attributes",
+    "Do not use transparent headers without blur",
+    "Maintain clean modular structure suitable for TY BSc IT/CA viva",
+    "Implement robust error handling and form validation"
+  ]
+}
