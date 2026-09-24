@@ -22,6 +22,7 @@ mirroring the relational schema shown in the project report):
 """
 import html
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -36,6 +37,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
@@ -257,9 +259,10 @@ async def events(search: str = "", category: str = "", status: str = "",
                  user=Depends(current_user)):
     query = {}
     if search:
+        safe_search = re.escape(search.strip())
         query["$or"] = [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
+            {"title": {"$regex": safe_search, "$options": "i"}},
+            {"description": {"$regex": safe_search, "$options": "i"}},
         ]
     if category:
         query["category"] = category
@@ -694,6 +697,13 @@ async def lifespan(app: FastAPI):
     await db.registrations.create_index([("event_id", 1), ("user_id", 1)], unique=True)
     await db.attendance.create_index("registration_id", unique=True)
     await db.login_attempts.create_index("identifier", unique=True)
+    # Additional high-performance query indexes
+    await db.events.create_index([("date", 1), ("status", 1)])
+    await db.events.create_index("category")
+    await db.registrations.create_index([("user_id", 1), ("event_id", 1)])
+    await db.registrations.create_index([("event_id", 1), ("status", 1)])
+    await db.attendance.create_index([("registration_id", 1), ("present", 1)])
+    await db.announcements.create_index([("created_at", -1)])
 
     admin_email = os.environ["ADMIN_EMAIL"]
     admin_password = os.environ["ADMIN_PASSWORD"]
@@ -737,6 +747,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="College Event Management System", lifespan=lifespan)
+
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+# GZip Compression Middleware (fast payload transfer)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 cors_origins = [origin.strip() for origin in os.environ.get(
     "CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",") if origin.strip()]
 app.add_middleware(
