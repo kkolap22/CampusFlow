@@ -42,8 +42,12 @@ from fastapi.responses import HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
 
-client = AsyncIOMotorClient(os.environ["MONGO_URL"])
-db = client[os.environ["DB_NAME"]]
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+DB_NAME = os.getenv("DB_NAME", "college_events")
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
 api = APIRouter(prefix="/api")
 JWT_ALGORITHM = "HS256"
 
@@ -135,7 +139,7 @@ def token_for(user):
         "type": "access",
         "exp": datetime.now(timezone.utc) + timedelta(hours=8),
     }
-    return jwt.encode(payload, os.environ["JWT_SECRET"], algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 async def current_user(request: Request):
@@ -146,7 +150,7 @@ async def current_user(request: Request):
     if not token:
         raise HTTPException(401, "Please log in to continue")
     try:
-        payload = jwt.decode(token, os.environ["JWT_SECRET"], algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(401, "Invalid token type")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
@@ -705,8 +709,8 @@ async def lifespan(app: FastAPI):
     await db.attendance.create_index([("registration_id", 1), ("present", 1)])
     await db.announcements.create_index([("created_at", -1)])
 
-    admin_email = os.environ["ADMIN_EMAIL"]
-    admin_password = os.environ["ADMIN_PASSWORD"]
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@campus.edu")
+    admin_password = os.getenv("ADMIN_PASSWORD", "Admin@123")
     if not await db.users.find_one({"email": admin_email}):
         await db.users.insert_one({
             "name": "System Admin", "email": admin_email,

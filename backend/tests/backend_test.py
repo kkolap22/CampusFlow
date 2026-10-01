@@ -12,7 +12,7 @@ import uuid
 import pytest
 import requests
 
-BASE = os.environ["REACT_APP_BACKEND_URL"].rstrip("/") + "/api"
+BASE = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8001").rstrip("/") + "/api"
 ADMIN = ("admin@campus.edu", "Admin@123")
 STUDENT = ("student@campus.edu", "student123")
 
